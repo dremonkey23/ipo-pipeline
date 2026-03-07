@@ -1,4 +1,5 @@
 const path = require('path');
+const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const express = require('express');
@@ -67,11 +68,57 @@ app.get('/api/health', (req, res) => {
   const filingCount = db.prepare('SELECT COUNT(*) as count FROM filings').get().count;
   const alertCount = db.prepare('SELECT COUNT(*) as count FROM alerts').get().count;
   const userCount = db.prepare('SELECT COUNT(*) as count FROM users').get().count;
+
+  // Storage monitoring
+  const RENDER_DISK_LIMIT_GB = 1;
+  const RENDER_DISK_LIMIT_MB = RENDER_DISK_LIMIT_GB * 1024;
+  let storage = { error: 'Unable to calculate storage' };
+  try {
+    // Database file size
+    const dbStats = fs.statSync(DB_PATH);
+    const dbSizeMb = +(dbStats.size / (1024 * 1024)).toFixed(2);
+
+    // Total disk usage — walk the data directory on Render, or local data dir
+    let totalUsageMb = dbSizeMb;
+    try {
+      const walkDir = (dir) => {
+        let total = 0;
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          const fullPath = path.join(dir, entry.name);
+          try {
+            if (entry.isDirectory()) {
+              total += walkDir(fullPath);
+            } else if (entry.isFile()) {
+              total += fs.statSync(fullPath).size;
+            }
+          } catch { /* skip inaccessible files */ }
+        }
+        return total;
+      };
+      totalUsageMb = +(walkDir(DB_DIR) / (1024 * 1024)).toFixed(2);
+    } catch { /* fall back to just db size */ }
+
+    const usagePercent = +((totalUsageMb / RENDER_DISK_LIMIT_MB) * 100).toFixed(2);
+
+    storage = {
+      database_size_mb: dbSizeMb,
+      total_usage_mb: totalUsageMb,
+      limit_gb: RENDER_DISK_LIMIT_GB,
+      usage_percent: usagePercent,
+      warning: usagePercent >= 80,
+      critical: usagePercent >= 90,
+    };
+  } catch (err) {
+    storage = { error: `Storage check failed: ${err.message}` };
+  }
+
   res.json({
     status: 'ok',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
     db: { companies: companyCount, filings: filingCount, alerts: alertCount, users: userCount },
+    storage,
   });
 });
 
