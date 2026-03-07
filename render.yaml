@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: ipo-pipeline-api
+    runtime: node
+    region: ohio
+    plan: starter
+    buildCommand: cd backend && npm install
+    startCommand: cd backend && node server.js
+    envVars:
+      - key: RENDER
+        value: true
+      - key: PORT
+        value: 3002
+      - key: JWT_SECRET
+        generateValue: true
+      - key: SEC_USER_AGENT
+        value: Mirzayan LLC andre@mirzayanconsulting.com
+    disk:
+      name: ipo-pipeline-data
+      mountPath: /data
+      sizeGB: 1

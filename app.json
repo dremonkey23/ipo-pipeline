@@ -1,0 +1,40 @@
+{
+  "expo": {
+    "name": "IPO Pipeline",
+    "slug": "ipo-pipeline",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "ipo-pipeline",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#080c14"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.mirzayanllc.ipopipeline",
+      "buildNumber": "1"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundColor": "#080c14"
+      },
+      "package": "com.mirzayanllc.ipopipeline"
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "static",
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
