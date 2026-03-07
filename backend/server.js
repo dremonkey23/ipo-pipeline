@@ -22,7 +22,23 @@ const app = express();
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+
+// HTTPS enforcement in production (Render handles TLS termination via X-Forwarded-Proto)
+if (process.env.RENDER || process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', 1);
+  app.use((req, res, next) => {
+    if (req.headers['x-forwarded-proto'] !== 'https') {
+      return res.redirect(301, `https://${req.hostname}${req.url}`);
+    }
+    // Security headers
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    next();
+  });
+}
 app.use(rateLimit({
   windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS) || 60000,
   max: Number(process.env.RATE_LIMIT_MAX) || 100,
@@ -104,10 +120,14 @@ cron.schedule('30 */4 * * *', async () => {
 cron.schedule('0 0 * * *', () => {
   const days = 90;
   console.log(`[CRON] Cleaning up alerts older than ${days} days...`);
-  const result = db.prepare(
-    `DELETE FROM alerts WHERE created_at < datetime('now', '-' || ? || ' days') AND is_read = 1`
-  ).run(days);
-  console.log(`[CRON] Cleaned up ${result.changes} old alerts`);
+  try {
+    const result = db.prepare(
+      `DELETE FROM alerts WHERE created_at < datetime('now', '-${days} days') AND is_read = 1`
+    ).run();
+    console.log(`[CRON] Cleaned up ${result.changes} old alerts`);
+  } catch (err) {
+    console.error(`[CRON] Alert cleanup error:`, err.message);
+  }
 });
 
 // ─── Start Server ───────────────────────────────────────────

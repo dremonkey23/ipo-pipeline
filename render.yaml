@@ -9,12 +9,18 @@ services:
     envVars:
       - key: RENDER
         value: true
+      - key: NODE_ENV
+        value: production
       - key: PORT
         value: 3002
       - key: JWT_SECRET
         generateValue: true
       - key: SEC_USER_AGENT
         value: Mirzayan LLC andre@mirzayanconsulting.com
+      - key: RATE_LIMIT_WINDOW_MS
+        value: 60000
+      - key: RATE_LIMIT_MAX
+        value: 100
     disk:
       name: ipo-pipeline-data
       mountPath: /data

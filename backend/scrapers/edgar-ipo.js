@@ -303,6 +303,14 @@ async function parseS1Document(db, filingId) {
   }
 }
 
+function safeParseNumber(str) {
+  if (!str) return null;
+  const cleaned = str.replace(/[,$\s]/g, '');
+  const num = parseFloat(cleaned);
+  if (isNaN(num) || !isFinite(num)) return null;
+  return num;
+}
+
 function extractFinancials(text) {
   const result = {
     revenueLatest: null,
@@ -311,31 +319,53 @@ function extractFinancials(text) {
     netIncome: null,
   };
 
-  // Look for revenue patterns (simplified — real parsing would use XBRL)
+  // Revenue patterns — ordered from most to least specific
   const revenuePatterns = [
-    /total (?:net )?revenue[s]?\s*[\$]?\s*([\d,]+(?:\.\d+)?)\s*(?:million|m\b)/i,
-    /(?:net )?revenue[s]?\s*(?:was|were|of)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:million|m\b)/i,
+    /total (?:net )?revenue[s]?\s*(?:was|were|of)?\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:billion|b\b)/i,
+    /total (?:net )?revenue[s]?\s*(?:was|were|of)?\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:million|m\b)/i,
+    /(?:net )?revenue[s]?\s*(?:was|were|of|totaled|totalling)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:billion|b\b)/i,
+    /(?:net )?revenue[s]?\s*(?:was|were|of|totaled|totalling)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:million|m\b)/i,
+    /revenue[s]?\s*(?:increased|decreased|grew)?\s*(?:to|from)?\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:million|m\b)/i,
+    /\$\s*([\d,]+(?:\.\d+)?)\s*(?:million|m)\s*(?:in\s+)?(?:total\s+)?(?:net\s+)?revenue/i,
   ];
 
   for (const pattern of revenuePatterns) {
     const match = text.match(pattern);
     if (match) {
-      result.revenueLatest = parseFloat(match[1].replace(/,/g, '')) * 1000000;
-      break;
+      const val = safeParseNumber(match[1]);
+      if (val !== null && val > 0) {
+        const isBillion = /billion|b\b/i.test(match[0]);
+        result.revenueLatest = val * (isBillion ? 1e9 : 1e6);
+        break;
+      }
     }
   }
 
-  // Net income/loss
+  // Net income/loss — multiple fallback patterns
   const incomePatterns = [
-    /net (?:income|loss)\s*(?:was|of)\s*\$?\s*\(?([\d,]+(?:\.\d+)?)\)?\s*(?:million|m\b)/i,
+    /net (?:income|loss)\s*(?:was|were|of|totaled)?\s*\$?\s*\(?([\d,]+(?:\.\d+)?)\)?\s*(?:billion|b\b)/i,
+    /net (?:income|loss)\s*(?:was|were|of|totaled)?\s*\$?\s*\(?([\d,]+(?:\.\d+)?)\)?\s*(?:million|m\b)/i,
+    /(?:net loss|loss from operations)\s*(?:was|of|totaled)?\s*\$?\s*\(?([\d,]+(?:\.\d+)?)\)?\s*(?:million|m\b)/i,
   ];
   for (const pattern of incomePatterns) {
     const match = text.match(pattern);
     if (match) {
-      result.netIncome = parseFloat(match[1].replace(/,/g, '')) * 1000000;
-      if (text.includes('net loss')) result.netIncome = -Math.abs(result.netIncome);
-      break;
+      const val = safeParseNumber(match[1]);
+      if (val !== null) {
+        const isBillion = /billion|b\b/i.test(match[0]);
+        result.netIncome = val * (isBillion ? 1e9 : 1e6);
+        // Check for loss indicators: parentheses or "loss" keyword
+        if (/\(/.test(match[0]) || /net loss|loss from/i.test(match[0])) {
+          result.netIncome = -Math.abs(result.netIncome);
+        }
+        break;
+      }
     }
+  }
+
+  // Calculate growth if we have both
+  if (result.revenueLatest && result.revenuePrior && result.revenuePrior > 0) {
+    result.revenueGrowth = ((result.revenueLatest - result.revenuePrior) / result.revenuePrior * 100);
   }
 
   return result;
@@ -350,69 +380,131 @@ function extractOfferingDetails(text) {
     dealSizeHigh: null,
   };
 
-  // Price range: "$X.XX to $Y.YY per share" or "$X.XX and $Y.YY per share"
-  const pricePattern = /\$\s*([\d.]+)\s*(?:to|and)\s*\$\s*([\d.]+)\s*per\s*share/i;
-  const priceMatch = text.match(pricePattern);
-  if (priceMatch) {
-    result.priceLow = parseFloat(priceMatch[1]);
-    result.priceHigh = parseFloat(priceMatch[2]);
+  // Price range patterns — multiple fallbacks
+  const pricePatterns = [
+    /\$\s*([\d]+(?:\.\d{1,2})?)\s*(?:to|and)\s*\$\s*([\d]+(?:\.\d{1,2})?)\s*per\s*share/i,
+    /price\s*(?:range|between)\s*(?:of\s*)?\$\s*([\d]+(?:\.\d{1,2})?)\s*(?:to|and|-)\s*\$\s*([\d]+(?:\.\d{1,2})?)/i,
+    /between\s*\$\s*([\d]+(?:\.\d{1,2})?)\s*and\s*\$\s*([\d]+(?:\.\d{1,2})?)\s*per\s*share/i,
+    /initial\s*public\s*offering\s*price\s*(?:of\s*)?\$\s*([\d]+(?:\.\d{1,2})?)\s*per\s*share/i,
+  ];
+
+  for (const pattern of pricePatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      const low = safeParseNumber(match[1]);
+      const high = match[2] ? safeParseNumber(match[2]) : low;
+      // Validate: prices should be reasonable ($0.01 - $10,000)
+      if (low !== null && low > 0 && low < 10000 && high !== null && high > 0 && high < 10000) {
+        // Ensure low <= high
+        result.priceLow = Math.min(low, high);
+        result.priceHigh = Math.max(low, high);
+        break;
+      }
+    }
   }
 
-  // Shares offered: "X,XXX,XXX shares"
-  const sharesPattern = /([\d,]+)\s*shares\s*(?:of\s*(?:common|class\s*a)\s*stock)?/i;
-  const sharesMatch = text.match(sharesPattern);
-  if (sharesMatch) {
-    result.sharesOffered = parseInt(sharesMatch[1].replace(/,/g, ''));
+  // Shares offered patterns — multiple fallbacks
+  const sharesPatterns = [
+    /(?:offering|sell(?:ing)?)\s*([\d,]+)\s*shares\s*(?:of\s*(?:its\s*)?(?:common|class\s*a)\s*stock)/i,
+    /([\d,]+)\s*shares\s*(?:of\s*(?:its\s*)?(?:common|class\s*a)\s*stock)\s*(?:are|is)\s*(?:being\s*)?offer/i,
+    /(?:we\s*are\s*offering|this\s*offering\s*(?:of|consists))\s*([\d,]+)\s*shares/i,
+    /([\d,]+)\s*shares\s*(?:of\s*(?:common|class\s*a)\s*stock)?/i,
+  ];
+
+  for (const pattern of sharesPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      const shares = parseInt(match[1].replace(/,/g, ''), 10);
+      // Validate: share count should be reasonable (at least 100, less than 10B)
+      if (!isNaN(shares) && shares >= 100 && shares < 10000000000) {
+        result.sharesOffered = shares;
+        break;
+      }
+    }
   }
 
-  // Calculate deal size
-  if (result.sharesOffered && result.priceLow) {
+  // Calculate deal size with validation
+  if (result.sharesOffered && result.priceLow && result.priceLow > 0) {
     result.dealSizeLow = result.sharesOffered * result.priceLow;
   }
-  if (result.sharesOffered && result.priceHigh) {
+  if (result.sharesOffered && result.priceHigh && result.priceHigh > 0) {
     result.dealSizeHigh = result.sharesOffered * result.priceHigh;
   }
 
   return result;
 }
 
+function extractSection(doc$, headingPatterns, minLength, maxLength) {
+  let result = '';
+  
+  // Strategy 1: Look for heading elements (h1-h4, b, strong) then grab next sibling text
+  const headingSelectors = ['h1', 'h2', 'h3', 'h4', 'b', 'strong', 'p'];
+  for (const selector of headingSelectors) {
+    if (result) break;
+    doc$(selector).each((i, el) => {
+      if (result) return false;
+      const headText = doc$(el).text().trim().toLowerCase();
+      for (const pattern of headingPatterns) {
+        if (pattern instanceof RegExp ? pattern.test(headText) : headText.startsWith(pattern)) {
+          // Get text from parent or next siblings
+          const parentText = doc$(el).parent().text().trim();
+          if (parentText.length > minLength) {
+            result = parentText.substring(0, maxLength).trim();
+            return false;
+          }
+          // Try next element
+          const nextText = doc$(el).next().text().trim();
+          if (nextText.length > minLength) {
+            result = nextText.substring(0, maxLength).trim();
+            return false;
+          }
+        }
+      }
+    });
+  }
+
+  // Strategy 2: Fallback — scan all elements
+  if (!result) {
+    doc$('*').each((i, el) => {
+      if (result) return false;
+      const text = doc$(el).text().trim();
+      const lower = text.toLowerCase();
+      for (const pattern of headingPatterns) {
+        if ((pattern instanceof RegExp ? pattern.test(lower) : lower.startsWith(pattern)) && text.length > minLength) {
+          result = text.substring(0, maxLength).trim();
+          return false;
+        }
+      }
+    });
+  }
+
+  return result || null;
+}
+
 function extractRiskFactors(doc$) {
-  // Find the Risk Factors section and grab first ~500 chars
-  let riskText = '';
-  doc$('*').each((i, el) => {
-    const text = doc$(el).text().trim();
-    if (text.toLowerCase().startsWith('risk factors') && text.length > 50) {
-      riskText = text.substring(0, 800).trim();
-      return false;
-    }
-  });
-  return riskText || null;
+  return extractSection(doc$, [
+    'risk factors',
+    /^risks?\s+factors?/,
+    'risks related to',
+  ], 50, 800);
 }
 
 function extractBusinessSummary(doc$) {
-  let summary = '';
-  doc$('*').each((i, el) => {
-    const text = doc$(el).text().trim();
-    if ((text.toLowerCase().startsWith('our business') || 
-         text.toLowerCase().startsWith('overview') ||
-         text.toLowerCase().startsWith('company overview')) && text.length > 100) {
-      summary = text.substring(0, 600).trim();
-      return false;
-    }
-  });
-  return summary || null;
+  return extractSection(doc$, [
+    'our business',
+    'company overview',
+    'overview',
+    'business overview',
+    /^about\s+(?:us|the\s+company)/,
+    'prospectus summary',
+  ], 100, 600);
 }
 
 function extractUseOfProceeds(doc$) {
-  let proceeds = '';
-  doc$('*').each((i, el) => {
-    const text = doc$(el).text().trim();
-    if (text.toLowerCase().startsWith('use of proceeds') && text.length > 50) {
-      proceeds = text.substring(0, 500).trim();
-      return false;
-    }
-  });
-  return proceeds || null;
+  return extractSection(doc$, [
+    'use of proceeds',
+    /^uses?\s+of\s+proceeds/,
+  ], 50, 500);
 }
 
 /**
@@ -454,15 +546,17 @@ function detectAmendmentChanges(db, companyId) {
     const summary = changes.join('; ');
     db.prepare('UPDATE filings SET change_summary = ? WHERE id = ?').run(summary, latest.id);
 
-    // Create high-severity alert for pricing changes
+    // Create high-severity alert for pricing changes (parameterized)
     db.prepare(`
       INSERT INTO alerts (company_id, alert_type, title, message, severity)
-      VALUES (?, 'deal_size_change', ?, ?, 'high')
-    `).run(
-      companyId,
-      `Pricing Update: ${latest.form_type}`,
-      summary
-    );
+      VALUES (@company_id, @alert_type, @title, @message, @severity)
+    `).run({
+      company_id: companyId,
+      alert_type: 'deal_size_change',
+      title: `Pricing Update: ${latest.form_type}`,
+      message: summary,
+      severity: 'high',
+    });
   }
 
   return changes;

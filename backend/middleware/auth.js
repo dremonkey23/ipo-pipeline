@@ -1,6 +1,6 @@
 const jwt = require('jsonwebtoken');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'ipo_pipeline_secret_2026';
+const JWT_SECRET = process.env.JWT_SECRET || 'ipo_pipeline_dev_secret_2026';
 
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
