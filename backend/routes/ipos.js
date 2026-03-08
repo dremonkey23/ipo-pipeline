@@ -19,7 +19,7 @@ module.exports = function (db) {
 
   // GET /api/ipos — list all IPOs with latest filing data
   router.get('/', (req, res) => {
-    const { status, sector, limit = 50, offset = 0, sort = 'newest' } = req.query;
+    const { status, sector, limit = 50, offset = 0, sort = 'newest', search, all } = req.query;
 
     let where = ['1=1'];
     let params = {};
@@ -32,10 +32,17 @@ module.exports = function (db) {
       where.push('c.sector = @sector');
       params.sector = sector;
     }
+    if (search) {
+      where.push("(c.company_name LIKE @search OR c.ticker LIKE @search OR c.sector LIKE @search OR c.industry LIKE @search)");
+      params.search = `%${search}%`;
+    }
 
     const orderBy = sort === 'deal_size' ? 'f.deal_size_high DESC NULLS LAST' :
                     sort === 'oldest' ? 'c.created_at ASC' :
                     'c.updated_at DESC';
+
+    // When 'all=true' is passed, return full dataset (up to 1000) for client-side filtering
+    const maxLimit = all === 'true' ? 1000 : 500;
 
     const query = `
       SELECT c.*, 
@@ -63,7 +70,7 @@ module.exports = function (db) {
       LIMIT @limit OFFSET @offset
     `;
 
-    params.limit = Math.min(Number(limit), 100);
+    params.limit = Math.min(Number(limit), maxLimit);
     params.offset = Number(offset);
 
     const ipos = db.prepare(query).all(params);

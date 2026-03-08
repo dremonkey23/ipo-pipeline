@@ -191,6 +191,13 @@ async function scrapeFormType(db, formType) {
         }
 
         console.log(`[IPO-EDGAR] ${isInitial ? '🚀 NEW' : '📝'} ${companyName} — ${form} (${filingDate})`);
+
+        // Enrich company data from EDGAR (sector, exchange, ticker) for new filings
+        if (isInitial) {
+          enrichCompanyData(db, cik).catch(err => 
+            console.log(`[IPO-EDGAR] Enrich error for ${companyName}: ${err.message}`)
+          );
+        }
       }
     } catch (err) {
       console.log(`[IPO-EDGAR] Error processing ${companyName || 'unknown'}: ${err.message}`);
@@ -263,6 +270,9 @@ async function parseS1Document(db, filingId) {
     const businessSummary = extractBusinessSummary(doc$);
     const useOfProceeds = extractUseOfProceeds(doc$);
 
+    // Extract exchange from S-1 text
+    const exchangeInfo = extractExchangeFromText(fullText);
+    
     // Update filing with parsed data
     db.prepare(`
       UPDATE filings SET
@@ -294,6 +304,26 @@ async function parseS1Document(db, filingId) {
       business_summary: businessSummary,
       use_of_proceeds: useOfProceeds,
     });
+
+    // Update company with exchange/ticker info from S-1 text if missing
+    if (exchangeInfo.exchange || exchangeInfo.ticker) {
+      const company = db.prepare('SELECT * FROM companies WHERE id = ?').get(filing.company_id);
+      if (company) {
+        const companyUpdates = [];
+        const companyParams = { id: company.id };
+        if (exchangeInfo.exchange && !company.exchange) {
+          companyUpdates.push('exchange = @exchange');
+          companyParams.exchange = exchangeInfo.exchange;
+        }
+        if (exchangeInfo.ticker && !company.ticker) {
+          companyUpdates.push('ticker = @ticker');
+          companyParams.ticker = exchangeInfo.ticker;
+        }
+        if (companyUpdates.length > 0) {
+          db.prepare(`UPDATE companies SET ${companyUpdates.join(', ')}, updated_at = datetime('now') WHERE id = @id`).run(companyParams);
+        }
+      }
+    }
 
     console.log(`[S1-PARSER] Parsed: revenue=$${financials.revenueLatest || 'N/A'}, price range=$${offeringDetails.priceLow || '?'}-$${offeringDetails.priceHigh || '?'}`);
     return { financials, offeringDetails };
@@ -508,6 +538,50 @@ function extractUseOfProceeds(doc$) {
 }
 
 /**
+ * Extract exchange listing and ticker symbol from S-1 text
+ */
+function extractExchangeFromText(text) {
+  const result = { exchange: null, ticker: null };
+
+  // Exchange patterns
+  const exchangePatterns = [
+    /(?:list|trade|trading)\s*(?:on|under)\s*(?:the\s*)?(nasdaq|nyse|new york stock exchange)/i,
+    /(?:nasdaq|nyse|new york stock exchange)\s*(?:global\s*(?:select\s*)?market|capital\s*market|american)/i,
+    /(?:apply|applied)\s*(?:to\s*)?(?:list|have)\s*(?:our|its|the)\s*(?:shares|stock|common)\s*(?:listed\s*)?(?:on|for\s*listing\s*on)\s*(?:the\s*)?(nasdaq|nyse|new york stock exchange)/i,
+  ];
+
+  for (const pattern of exchangePatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      const raw = match[1] || match[0];
+      if (/nasdaq/i.test(raw)) result.exchange = 'NASDAQ';
+      else if (/nyse|new york stock exchange/i.test(raw)) result.exchange = 'NYSE';
+      break;
+    }
+  }
+
+  // Ticker patterns
+  const tickerPatterns = [
+    /(?:under\s*the\s*(?:ticker\s*)?symbol|trading\s*symbol)\s*[""'"]\s*([A-Z]{1,5})\s*[""'"]/i,
+    /(?:under\s*the\s*(?:ticker\s*)?symbol|trading\s*symbol)\s*(\b[A-Z]{1,5}\b)/i,
+  ];
+
+  for (const pattern of tickerPatterns) {
+    const match = text.match(pattern);
+    if (match && match[1]) {
+      const ticker = match[1].toUpperCase();
+      // Validate it looks like a ticker (1-5 uppercase letters)
+      if (/^[A-Z]{1,5}$/.test(ticker)) {
+        result.ticker = ticker;
+        break;
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
  * Detect pricing changes between amendments
  */
 function detectAmendmentChanges(db, companyId) {
@@ -562,4 +636,176 @@ function detectAmendmentChanges(db, companyId) {
   return changes;
 }
 
-module.exports = { scrapeIPOFilings, parseS1Document, detectAmendmentChanges };
+/**
+ * SIC code to sector mapping
+ */
+const SIC_SECTOR_MAP = {
+  // Technology
+  '3571': 'Technology', '3572': 'Technology', '3577': 'Technology', '3579': 'Technology',
+  '3661': 'Technology', '3669': 'Technology', '3672': 'Technology', '3674': 'Technology',
+  '3679': 'Technology', '3812': 'Technology', '3825': 'Technology', '3827': 'Technology',
+  '5045': 'Technology', '5065': 'Technology', '7371': 'Technology', '7372': 'Technology',
+  '7373': 'Technology', '7374': 'Technology', '7379': 'Technology',
+  // Healthcare / Biotech / Pharma
+  '2830': 'Healthcare', '2833': 'Healthcare', '2834': 'Healthcare', '2835': 'Healthcare',
+  '2836': 'Healthcare', '3841': 'Healthcare', '3842': 'Healthcare', '3844': 'Healthcare',
+  '3845': 'Healthcare', '3851': 'Healthcare', '5047': 'Healthcare', '5122': 'Healthcare',
+  '8000': 'Healthcare', '8011': 'Healthcare', '8049': 'Healthcare', '8060': 'Healthcare',
+  '8062': 'Healthcare', '8071': 'Healthcare', '8082': 'Healthcare', '8090': 'Healthcare',
+  '8093': 'Healthcare', '8099': 'Healthcare',
+  // Financial
+  '6020': 'Financial', '6021': 'Financial', '6022': 'Financial', '6035': 'Financial',
+  '6036': 'Financial', '6099': 'Financial', '6111': 'Financial', '6141': 'Financial',
+  '6153': 'Financial', '6159': 'Financial', '6162': 'Financial', '6163': 'Financial',
+  '6199': 'Financial', '6200': 'Financial', '6211': 'Financial', '6282': 'Financial',
+  '6311': 'Financial', '6321': 'Financial', '6324': 'Financial', '6331': 'Financial',
+  '6399': 'Financial', '6411': 'Financial', '6726': 'Financial',
+  // Energy
+  '1311': 'Energy', '1381': 'Energy', '1382': 'Energy', '1389': 'Energy',
+  '2911': 'Energy', '4911': 'Energy', '4924': 'Energy', '4931': 'Energy',
+  '4932': 'Energy', '4941': 'Energy', '4991': 'Energy',
+  // Consumer
+  '2000': 'Consumer', '2011': 'Consumer', '2013': 'Consumer', '2020': 'Consumer',
+  '2024': 'Consumer', '2030': 'Consumer', '2040': 'Consumer', '2050': 'Consumer',
+  '2060': 'Consumer', '2080': 'Consumer', '2090': 'Consumer', '2111': 'Consumer',
+  '5311': 'Consumer', '5331': 'Consumer', '5411': 'Consumer', '5412': 'Consumer',
+  '5600': 'Consumer', '5651': 'Consumer', '5700': 'Consumer', '5731': 'Consumer',
+  '5812': 'Consumer', '5912': 'Consumer', '5940': 'Consumer', '5944': 'Consumer',
+  '5945': 'Consumer', '5947': 'Consumer', '5961': 'Consumer', '5990': 'Consumer',
+  // Industrial / Manufacturing
+  '3310': 'Industrial', '3312': 'Industrial', '3317': 'Industrial', '3350': 'Industrial',
+  '3411': 'Industrial', '3412': 'Industrial', '3420': 'Industrial', '3440': 'Industrial',
+  '3460': 'Industrial', '3490': 'Industrial', '3510': 'Industrial', '3523': 'Industrial',
+  '3530': 'Industrial', '3537': 'Industrial', '3540': 'Industrial', '3550': 'Industrial',
+  '3560': 'Industrial', '3585': 'Industrial', '3590': 'Industrial', '3711': 'Industrial',
+  '3713': 'Industrial', '3714': 'Industrial', '3720': 'Industrial', '3728': 'Industrial',
+  // Real Estate
+  '6500': 'Real Estate', '6510': 'Real Estate', '6512': 'Real Estate', '6531': 'Real Estate',
+  '6552': 'Real Estate', '6798': 'Real Estate',
+};
+
+function sicToSector(sicCode) {
+  if (!sicCode) return null;
+  const sic = String(sicCode).trim();
+  if (SIC_SECTOR_MAP[sic]) return SIC_SECTOR_MAP[sic];
+  // Try 2-digit prefix matching
+  const prefix2 = sic.substring(0, 2);
+  if (['73', '35', '36', '37'].includes(prefix2) && sic.startsWith('73')) return 'Technology';
+  if (['28', '38', '80'].includes(prefix2)) return 'Healthcare';
+  if (['60', '61', '62', '63', '64', '67'].includes(prefix2)) return 'Financial';
+  if (['10', '12', '13', '14', '29', '49'].includes(prefix2)) return 'Energy';
+  if (['20', '21', '51', '52', '53', '54', '55', '56', '57', '58', '59'].includes(prefix2)) return 'Consumer';
+  if (['24', '25', '26', '27', '30', '31', '32', '33', '34', '35', '36', '37', '39'].includes(prefix2)) return 'Industrial';
+  if (['65', '67'].includes(prefix2)) return 'Real Estate';
+  return null;
+}
+
+/**
+ * Enrich company data from EDGAR submissions API
+ * Fetches SIC code, ticker, exchange, and other metadata
+ */
+async function enrichCompanyData(db, cik) {
+  const paddedCik = String(cik).padStart(10, '0');
+  const url = `https://data.sec.gov/submissions/CIK${paddedCik}.json`;
+
+  try {
+    await sleep(DELAY_MS);
+    const res = await axios.get(url, { headers: HEADERS, timeout: 15000 });
+    const data = res.data;
+
+    if (!data) return null;
+
+    const updates = {};
+    
+    // Extract ticker(s)
+    if (data.tickers && data.tickers.length > 0) {
+      updates.ticker = data.tickers[0];
+    }
+    
+    // Extract exchange(s)
+    if (data.exchanges && data.exchanges.length > 0) {
+      const exchange = data.exchanges[0];
+      updates.exchange = exchange;
+    }
+    
+    // Extract SIC code and map to sector
+    if (data.sic) {
+      const sector = sicToSector(data.sic);
+      if (sector) updates.sector = sector;
+      updates.industry = data.sicDescription || null;
+    }
+    
+    // Extract state/headquarters
+    if (data.stateOfIncorporation) {
+      updates.headquarters = data.stateOfIncorporation;
+    }
+    if (data.addresses && data.addresses.business) {
+      const biz = data.addresses.business;
+      if (biz.stateOrCountry) {
+        updates.headquarters = [biz.city, biz.stateOrCountry].filter(Boolean).join(', ');
+      }
+    }
+
+    // Extract website
+    if (data.website) {
+      updates.website = data.website;
+    }
+
+    // Apply updates
+    if (Object.keys(updates).length > 0) {
+      const setClauses = [];
+      const params = { cik };
+      for (const [key, value] of Object.entries(updates)) {
+        if (value !== null && value !== undefined) {
+          setClauses.push(`${key} = COALESCE(@${key}, ${key})`);
+          params[key] = value;
+        }
+      }
+      if (setClauses.length > 0) {
+        // Only update if current value is NULL (don't overwrite manual edits)
+        const updateParts = Object.entries(updates)
+          .filter(([, v]) => v !== null && v !== undefined)
+          .map(([key]) => `${key} = CASE WHEN ${key} IS NULL THEN @${key} ELSE ${key} END`);
+        
+        if (updateParts.length > 0) {
+          db.prepare(`UPDATE companies SET ${updateParts.join(', ')}, updated_at = datetime('now') WHERE cik = @cik`).run(params);
+          console.log(`[ENRICH] ${cik}: ${Object.entries(updates).filter(([,v]) => v).map(([k,v]) => `${k}=${v}`).join(', ')}`);
+        }
+      }
+    }
+
+    return updates;
+  } catch (err) {
+    // 404 is common for very new filings
+    if (err.response && err.response.status === 404) return null;
+    console.error(`[ENRICH] Error enriching CIK ${cik}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Batch-enrich all companies missing sector/exchange/ticker data
+ */
+async function enrichAllCompanies(db) {
+  const missing = db.prepare(`
+    SELECT cik FROM companies 
+    WHERE (sector IS NULL OR exchange IS NULL OR ticker IS NULL)
+    AND cik IS NOT NULL
+    ORDER BY updated_at DESC
+    LIMIT 25
+  `).all();
+
+  console.log(`[ENRICH] Enriching ${missing.length} companies with missing data...`);
+  let enriched = 0;
+
+  for (const { cik } of missing) {
+    const result = await enrichCompanyData(db, cik);
+    if (result && Object.keys(result).length > 0) enriched++;
+    await sleep(300); // Be polite to SEC
+  }
+
+  console.log(`[ENRICH] Enriched ${enriched}/${missing.length} companies`);
+  return enriched;
+}
+
+module.exports = { scrapeIPOFilings, parseS1Document, detectAmendmentChanges, enrichCompanyData, enrichAllCompanies, sicToSector };

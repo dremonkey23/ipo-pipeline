@@ -32,6 +32,13 @@ export async function getIPOs(params = {}) {
   return apiFetch(`/ipos?${qs}`);
 }
 
+export async function getAllIPOs(params = {}) {
+  // Fetch all IPOs for client-side filtering (up to 1000)
+  const merged = { ...params, all: 'true', limit: '1000' };
+  const qs = new URLSearchParams(merged).toString();
+  return apiFetch(`/ipos?${qs}`);
+}
+
 export async function getIPODetail(id) {
   return apiFetch(`/ipos/${id}`);
 }

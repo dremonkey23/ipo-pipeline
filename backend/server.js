@@ -7,7 +7,7 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const cron = require('node-cron');
 const { initDb } = require('./db/schema');
-const { scrapeIPOFilings, parseS1Document } = require('./scrapers/edgar-ipo');
+const { scrapeIPOFilings, parseS1Document, enrichAllCompanies } = require('./scrapers/edgar-ipo');
 
 // ─── Config ─────────────────────────────────────────────────
 const PORT = process.env.PORT || 3002;
@@ -163,6 +163,16 @@ cron.schedule('30 */4 * * *', async () => {
   }
 });
 
+// Company data enrichment — every 2 hours (fill missing sector/exchange/ticker)
+cron.schedule('15 */2 * * *', async () => {
+  console.log('[CRON] Running company data enrichment...');
+  try {
+    await enrichAllCompanies(db);
+  } catch (err) {
+    console.error('[CRON] Enrichment error:', err.message);
+  }
+});
+
 // Cleanup old alerts — daily at midnight
 cron.schedule('0 0 * * *', () => {
   const days = 90;
@@ -190,11 +200,16 @@ app.listen(PORT, () => {
   console.log(`   Deep S-1 parser: every 4 hours`);
   console.log(`   Alert cleanup: daily at midnight`);
 
-  // Run scraper on startup
+  // Run scraper on startup, then enrich missing data
   console.log('\n🔄 Running initial IPO scrape...');
   scrapeIPOFilings(db)
-    .then(() => console.log('✅ Initial IPO scrape complete'))
-    .catch(err => console.error('❌ Initial IPO scrape failed:', err.message));
+    .then(() => {
+      console.log('✅ Initial IPO scrape complete');
+      console.log('🔄 Running company data enrichment...');
+      return enrichAllCompanies(db);
+    })
+    .then(() => console.log('✅ Company enrichment complete'))
+    .catch(err => console.error('❌ Startup task failed:', err.message));
 });
 
 // Graceful shutdown

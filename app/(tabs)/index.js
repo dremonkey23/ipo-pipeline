@@ -1,4 +1,4 @@
-import { View, Text, TouchableOpacity, StyleSheet, FlatList, RefreshControl, ActivityIndicator, Animated, Modal, ScrollView, Pressable, Platform, Dimensions, LayoutAnimation, UIManager } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, FlatList, RefreshControl, ActivityIndicator, Animated, Modal, ScrollView, Pressable, Platform, Dimensions, LayoutAnimation, UIManager, TextInput } from 'react-native';
 import { useRouter, useFocusEffect } from 'expo-router';
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { Ionicons } from '@expo/vector-icons';
@@ -197,7 +197,8 @@ function StageInfoModal({ visible, stage, onClose }) {
   );
 }
 
-import { getIPOs, getIPOStats } from '../../services/api';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { getIPOs, getAllIPOs, getIPOStats } from '../../services/api';
 
 function formatValue(val) {
   if (!val && val !== 0) return 'TBD';
@@ -336,7 +337,7 @@ function FilterChip({ label, onRemove }) {
   );
 }
 
-function FilterSection({ filterKey, config, selectedOptions, onToggle, isExpanded, onToggleExpand }) {
+function FilterSection({ filterKey, config, selectedOptions, onToggle, isExpanded, onToggleExpand, optionCounts }) {
   return (
     <View style={styles.filterSection}>
       <TouchableOpacity style={styles.filterSectionHeader} onPress={onToggleExpand} activeOpacity={0.7}>
@@ -357,19 +358,25 @@ function FilterSection({ filterKey, config, selectedOptions, onToggle, isExpande
         <View style={styles.filterOptionsGrid}>
           {config.options.map(opt => {
             const isSelected = selectedOptions.includes(opt.key);
+            const count = optionCounts ? (optionCounts[opt.key] || 0) : null;
             return (
               <TouchableOpacity
                 key={opt.key}
-                style={[styles.filterOption, isSelected && styles.filterOptionActive]}
+                style={[styles.filterOption, isSelected && styles.filterOptionActive, count === 0 && !isSelected && styles.filterOptionDisabled]}
                 onPress={() => onToggle(filterKey, opt.key)}
                 activeOpacity={0.7}
               >
                 <View style={[styles.filterCheckbox, isSelected && styles.filterCheckboxActive]}>
                   {isSelected && <Ionicons name="checkmark" size={12} color={colors.white} />}
                 </View>
-                <Text style={[styles.filterOptionText, isSelected && styles.filterOptionTextActive]}>
+                <Text style={[styles.filterOptionText, isSelected && styles.filterOptionTextActive, count === 0 && !isSelected && { opacity: 0.4 }]}>
                   {opt.label}
                 </Text>
+                {count !== null && (
+                  <Text style={[styles.filterCountLabel, isSelected && styles.filterCountLabelActive]}>
+                    ({count})
+                  </Text>
+                )}
               </TouchableOpacity>
             );
           })}
@@ -379,7 +386,7 @@ function FilterSection({ filterKey, config, selectedOptions, onToggle, isExpande
   );
 }
 
-function FilterPanel({ visible, filters, onToggleOption, onClearAll, onClose, activeCount }) {
+function FilterPanel({ visible, filters, onToggleOption, onClearAll, onClose, activeCount, filterCounts, searchText, onSearchChange }) {
   const slideAnim = useRef(new Animated.Value(0)).current;
   const [expandedSections, setExpandedSections] = useState({});
 
@@ -399,7 +406,7 @@ function FilterPanel({ visible, filters, onToggleOption, onClearAll, onClose, ac
 
   return (
     <Animated.View style={[styles.filterPanel, {
-      maxHeight: slideAnim.interpolate({ inputRange: [0, 1], outputRange: [0, 600] }),
+      maxHeight: slideAnim.interpolate({ inputRange: [0, 1], outputRange: [0, 700] }),
       opacity: slideAnim,
     }]}>
       {/* Filter panel header */}
@@ -425,6 +432,26 @@ function FilterPanel({ visible, filters, onToggleOption, onClearAll, onClose, ac
         </View>
       </View>
 
+      {/* Text Search Field */}
+      <View style={styles.searchContainer}>
+        <Ionicons name="search-outline" size={16} color={colors.textMuted} />
+        <TextInput
+          style={styles.searchInput}
+          placeholder="Search companies, tickers..."
+          placeholderTextColor={colors.textMuted}
+          value={searchText}
+          onChangeText={onSearchChange}
+          autoCapitalize="none"
+          autoCorrect={false}
+          returnKeyType="search"
+        />
+        {searchText ? (
+          <TouchableOpacity onPress={() => onSearchChange('')} hitSlop={8}>
+            <Ionicons name="close-circle" size={16} color={colors.textMuted} />
+          </TouchableOpacity>
+        ) : null}
+      </View>
+
       <ScrollView
         style={styles.filterScrollView}
         showsVerticalScrollIndicator={false}
@@ -439,6 +466,7 @@ function FilterPanel({ visible, filters, onToggleOption, onClearAll, onClose, ac
             onToggle={onToggleOption}
             isExpanded={!!expandedSections[key]}
             onToggleExpand={() => toggleSection(key)}
+            optionCounts={filterCounts ? filterCounts[key] : null}
           />
         ))}
       </ScrollView>
@@ -632,13 +660,44 @@ export default function PipelineScreen() {
   // Advanced filters state
   const [showFilters, setShowFilters] = useState(false);
   const [filters, setFilters] = useState({});  // { dealSize: ['under50m'], sector: ['technology'], ... }
+  const [filtersLoaded, setFiltersLoaded] = useState(false);
+  const [searchText, setSearchText] = useState('');
+
+  // Load persisted filters on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const saved = await AsyncStorage.getItem('ipo_pipeline_filters');
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (parsed.filters) setFilters(parsed.filters);
+          if (parsed.statusFilter) setStatusFilter(parsed.statusFilter);
+          if (parsed.searchText) setSearchText(parsed.searchText);
+        }
+      } catch (e) {
+        // Ignore load errors
+      }
+      setFiltersLoaded(true);
+    })();
+  }, []);
+
+  // Persist filters whenever they change
+  useEffect(() => {
+    if (!filtersLoaded) return;
+    AsyncStorage.setItem('ipo_pipeline_filters', JSON.stringify({
+      filters,
+      statusFilter,
+      searchText,
+    })).catch(() => {});
+  }, [filters, statusFilter, searchText, filtersLoaded]);
 
   const loadData = useCallback(async () => {
     try {
       const params = {};
       if (statusFilter) params.status = statusFilter;
+      // Fetch ALL data for client-side filtering
       const [ipoData, statsData] = await Promise.all([
-        getIPOs(params),
+        getAllIPOs(params),
         getIPOStats(),
       ]);
       setIPOs(ipoData.data || []);
@@ -679,17 +738,31 @@ export default function PipelineScreen() {
 
   const clearAllFilters = useCallback(() => {
     setFilters({});
+    setSearchText('');
   }, []);
 
   const activeFilterCount = useMemo(() => {
     return Object.values(filters).reduce((sum, arr) => sum + arr.length, 0);
   }, [filters]);
 
-  // Apply client-side filters
-  const filteredIPOs = useMemo(() => {
-    if (activeFilterCount === 0) return ipos;
-
+  // Apply text search first, then client-side filters
+  const searchFilteredIPOs = useMemo(() => {
+    if (!searchText || searchText.trim().length === 0) return ipos;
+    const q = searchText.toLowerCase().trim();
     return ipos.filter(ipo => {
+      const name = (ipo.company_name || '').toLowerCase();
+      const ticker = (ipo.ticker || '').toLowerCase();
+      const sector = (ipo.sector || '').toLowerCase();
+      const industry = (ipo.industry || '').toLowerCase();
+      const summary = (ipo.business_summary || '').toLowerCase();
+      return name.includes(q) || ticker.includes(q) || sector.includes(q) || industry.includes(q) || summary.includes(q);
+    });
+  }, [ipos, searchText]);
+
+  const filteredIPOs = useMemo(() => {
+    if (activeFilterCount === 0) return searchFilteredIPOs;
+
+    return searchFilteredIPOs.filter(ipo => {
       // For each filter category with selections, the IPO must match at least one selected option (OR within category)
       // Across categories, all must pass (AND across categories)
       for (const [filterKey, selectedKeys] of Object.entries(filters)) {
@@ -705,7 +778,37 @@ export default function PipelineScreen() {
       }
       return true;
     });
-  }, [ipos, filters, activeFilterCount]);
+  }, [searchFilteredIPOs, filters, activeFilterCount]);
+
+  // Compute filter option counts — for each category, count matches considering OTHER active filters
+  const filterCounts = useMemo(() => {
+    const counts = {};
+    for (const filterKey of FILTER_KEYS) {
+      const config = FILTER_CONFIG[filterKey];
+      counts[filterKey] = {};
+
+      // Get the base set: apply all OTHER active filters + search (but not this filter category)
+      const baseSet = searchFilteredIPOs.filter(ipo => {
+        for (const [otherKey, selectedKeys] of Object.entries(filters)) {
+          if (otherKey === filterKey) continue; // Skip current category
+          const otherConfig = FILTER_CONFIG[otherKey];
+          if (!otherConfig || selectedKeys.length === 0) continue;
+          const matchesAny = selectedKeys.some(optKey => {
+            const opt = otherConfig.options.find(o => o.key === optKey);
+            return opt && opt.test(ipo);
+          });
+          if (!matchesAny) return false;
+        }
+        return true;
+      });
+
+      // Count how many in baseSet match each option
+      for (const opt of config.options) {
+        counts[filterKey][opt.key] = baseSet.filter(ipo => opt.test(ipo)).length;
+      }
+    }
+    return counts;
+  }, [searchFilteredIPOs, filters]);
 
   const statusFilters = [null, 'filed', 'amended', 'roadshow', 'priced', 'listed'];
 
@@ -760,6 +863,9 @@ export default function PipelineScreen() {
         onClearAll={clearAllFilters}
         onClose={() => setShowFilters(false)}
         activeCount={activeFilterCount}
+        filterCounts={filterCounts}
+        searchText={searchText}
+        onSearchChange={setSearchText}
       />
 
       {/* Active Filter Chips */}
@@ -798,11 +904,11 @@ export default function PipelineScreen() {
       <StageInfoModal visible={!!infoModalStage} stage={infoModalStage} onClose={() => setInfoModalStage(null)} />
 
       {/* Results count when filtering */}
-      {activeFilterCount > 0 && !loading && (
+      {(activeFilterCount > 0 || searchText.trim().length > 0) && !loading && (
         <View style={styles.resultsBar}>
           <Text style={styles.resultsText}>
             <Text style={{ color: colors.primary, fontWeight: '800' }}>{filteredIPOs.length}</Text>
-            <Text> of {ipos.length} IPOs match your filters</Text>
+            <Text> of {ipos.length} IPOs match{activeFilterCount > 0 ? ' your filters' : ''}{searchText.trim() ? ` "${searchText.trim()}"` : ''}</Text>
           </Text>
         </View>
       )}
@@ -828,16 +934,16 @@ export default function PipelineScreen() {
           }
           ListEmptyComponent={
             <View style={styles.emptyState}>
-              <Ionicons name={activeFilterCount > 0 ? 'funnel-outline' : 'rocket-outline'} size={48} color={colors.textMuted} />
+              <Ionicons name={(activeFilterCount > 0 || searchText) ? 'funnel-outline' : 'rocket-outline'} size={48} color={colors.textMuted} />
               <Text style={styles.emptyText}>
-                {activeFilterCount > 0 ? 'No matches found' : 'No IPOs found'}
+                {(activeFilterCount > 0 || searchText) ? 'No matches found' : 'No IPOs found'}
               </Text>
               <Text style={styles.emptySubtext}>
-                {activeFilterCount > 0
-                  ? 'Try adjusting your filters to see more results'
+                {(activeFilterCount > 0 || searchText)
+                  ? 'Try adjusting your filters or search to see more results'
                   : 'Check back later for new filings'}
               </Text>
-              {activeFilterCount > 0 && (
+              {(activeFilterCount > 0 || searchText) && (
                 <TouchableOpacity style={styles.emptyClearBtn} onPress={clearAllFilters} activeOpacity={0.7}>
                   <Ionicons name="refresh" size={16} color={colors.primary} />
                   <Text style={styles.emptyClearText}>Clear All Filters</Text>
@@ -1083,6 +1189,42 @@ const styles = StyleSheet.create({
   filterOptionTextActive: {
     color: colors.primary,
     fontWeight: '600',
+  },
+
+  // ─── Search Field ─────────────────────────────────────────
+  searchContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginHorizontal: spacing.md,
+    marginBottom: spacing.sm,
+    backgroundColor: colors.surface,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingHorizontal: 12,
+    paddingVertical: Platform.OS === 'ios' ? 10 : 6,
+    gap: 8,
+  },
+  searchInput: {
+    flex: 1,
+    fontSize: 14,
+    color: colors.white,
+    padding: 0,
+    margin: 0,
+  },
+
+  // ─── Filter Count Labels ────────────────────────────────
+  filterCountLabel: {
+    fontSize: 11,
+    color: colors.textMuted,
+    fontWeight: '600',
+    marginLeft: 2,
+  },
+  filterCountLabelActive: {
+    color: colors.primary,
+  },
+  filterOptionDisabled: {
+    opacity: 0.5,
   },
 
   // ─── Filter Chips ────────────────────────────────────────
